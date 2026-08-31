@@ -1,0 +1,272 @@
+#include <SFML/Graphics.hpp>
+#include <SFML/Network.hpp>
+#include <SFML/Window.hpp>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include "Expression.hpp"
+
+namespace cfg { constexpr unsigned W=1280, H=720; constexpr unsigned short PORT=42069; constexpr float PI=3.14159265358979323846f; }
+
+enum class Screen { Menu, Settings, HostWait, Connect, Game };
+enum class Msg : std::int32_t { Hello=1, Settings=2, Start=3, Shoot=4, State=5, Ping=6, Disconnect=7 };
+
+struct Settings { float scale=1.0f; float turnSeconds=60.0f; float wind=0.0f; };
+struct Player { float x=0, y=0; int hp=100; };
+struct Shot { bool active=false; float t=0, startX=0, startY=0, speed=1.0f, c=0; int dir=1; std::string expr; };
+
+static std::string fmt(float v, int p=2) { std::ostringstream s; s<<std::fixed<<std::setprecision(p)<<v; return s.str(); }
+
+class Net {
+public:
+    bool host=false, connected=false;
+    sf::TcpListener listener;
+    sf::TcpSocket socket;
+
+    bool startHost() {
+        if (listener.listen(cfg::PORT) != sf::Socket::Status::Done) return false;
+        listener.setBlocking(false); host=true; return true;
+    }
+    bool acceptClient() {
+        if (connected) return true;
+        auto c=std::make_unique<sf::TcpSocket>();
+        if (listener.accept(*c)==sf::Socket::Status::Done) {
+            socket=std::move(*c); socket.setBlocking(false); connected=true; listener.close(); return true;
+        }
+        return false;
+    }
+    bool connectTo(const std::string& ip) {
+        auto a=sf::IpAddress::fromString(ip); if(!a) return false;
+        if(socket.connect(*a,cfg::PORT,sf::seconds(3))!=sf::Socket::Status::Done) return false;
+        socket.setBlocking(false); connected=true; host=false; return true;
+    }
+    void send(sf::Packet& p) { if(connected) { (void)socket.send(p); } }
+    bool receive(sf::Packet& p) { if(!connected) return false; return socket.receive(p)==sf::Socket::Status::Done; }
+    void close() { socket.disconnect(); listener.close(); connected=false; }
+};
+
+class GameApp {
+    sf::RenderWindow window{sf::VideoMode({cfg::W,cfg::H}),"GraphWar Clone"};
+    sf::Font font;
+    Screen screen=Screen::Menu;
+    Settings settings;
+    Net net;
+    Player players[2];
+    Shot shot;
+    int localPlayer=0, turn=0;
+    float turnLeft=60;
+    float power=1.4f, constant=0.0f;
+    std::string function="sin(x)";
+    std::string input;
+    std::string error;
+    std::mt19937 rng{std::random_device{}()};
+    sf::Clock clock;
+    float syncTimer=0;
+    Expression compiled;
+    bool matchStarted=false;
+    bool editingFunction=false;
+
+public:
+    GameApp() {
+        window.setFramerateLimit(120);
+        (void)font.openFromFile("assets/arial.ttf");
+        resetPlayers();
+    }
+    void run() {
+        while(window.isOpen()) {
+            float dt=clock.restart().asSeconds();
+            events();
+            network();
+            update(std::min(dt,0.05f));
+            render();
+        }
+    }
+private:
+    void resetPlayers() {
+        players[0]={180.f,560.f,100}; players[1]={1100.f,560.f,100}; turn=0; turnLeft=settings.turnSeconds; shot={};
+    }
+    void startMatch() {
+        resetPlayers(); matchStarted=true; screen=Screen::Game; turnLeft=settings.turnSeconds;
+        if(!compileFunction()) { function="sin(x)"; compileFunction(); }
+    }
+    float groundY(float x) const {
+        return 590.f + 22.f*std::sin(x*0.007f)+14.f*std::sin(x*0.021f+1.7f);
+    }
+    float pixelsPerUnit() const { return 85.f*settings.scale; }
+    float worldX(float px, float originX) const { return (px-originX)/pixelsPerUnit(); }
+    float graphY(float px, float originX) const {
+        double x=worldX(px,originX), y=compiled.eval(x)+constant;
+        if(!std::isfinite(y) || std::abs(y)>1000) return NAN;
+        return players[turn].y-static_cast<float>(y*pixelsPerUnit());
+    }
+    bool compileFunction() {
+        std::string e; if(!compiled.parse(function,e)) { error=e; return false; } error.clear(); return true;
+    }
+    void events() {
+        while(auto ev=window.pollEvent()) {
+            if(ev->is<sf::Event::Closed>()) window.close();
+            if(auto* k=ev->getIf<sf::Event::KeyPressed>()) key(k->code);
+            if(auto* t=ev->getIf<sf::Event::TextEntered>()) text(t->unicode);
+        }
+    }
+    void text(char32_t u) {
+        if(screen==Screen::Settings || screen==Screen::Connect || (screen==Screen::Game && editingFunction)) {
+            if(u>=32 && u<127 && input.size()<80) input.push_back(static_cast<char>(u));
+        }
+    }
+    void key(sf::Keyboard::Key k) {
+        if(k==sf::Keyboard::Key::Escape && screen!=Screen::Menu) { net.close(); screen=Screen::Menu; editingFunction=false; return; }
+        if(screen==Screen::Menu) {
+            if(k==sf::Keyboard::Key::Num1) { net.close(); net.host=true; screen=Screen::Settings; }
+            else if(k==sf::Keyboard::Key::Num2) { input="127.0.0.1"; screen=Screen::Connect; }
+        } else if(screen==Screen::Settings) settingsKey(k);
+        else if(screen==Screen::Connect) {
+            if(k==sf::Keyboard::Key::Enter) { if(net.connectTo(input)) { localPlayer=1; screen=Screen::HostWait; } else error="Connection failed"; }
+            else if(k==sf::Keyboard::Key::Backspace && !input.empty()) input.pop_back();
+        } else if(screen==Screen::Game) gameKey(k);
+    }
+    void settingsKey(sf::Keyboard::Key k) {
+        if(k==sf::Keyboard::Key::Left) settings.scale=std::max(0.5f,settings.scale-0.25f);
+        if(k==sf::Keyboard::Key::Right) settings.scale=std::min(3.0f,settings.scale+0.25f);
+        if(k==sf::Keyboard::Key::Up) settings.turnSeconds=std::min(300.f,settings.turnSeconds+5.f);
+        if(k==sf::Keyboard::Key::Down) settings.turnSeconds=std::max(5.f,settings.turnSeconds-5.f);
+        if(k==sf::Keyboard::Key::Enter) {
+            if(net.host) { if(net.startHost()) screen=Screen::HostWait; else error="Port 42069 is unavailable"; }
+        }
+    }
+    void gameKey(sf::Keyboard::Key k) {
+        if(k==sf::Keyboard::Key::Tab && !shot.active && matchStarted && localPlayer==turn) { editingFunction=!editingFunction; if(editingFunction) input=function; return; }
+        if(editingFunction) {
+            if(k==sf::Keyboard::Key::Enter) { if(!input.empty()) { std::string oldFunction=function; function=input; if(!compileFunction()) function=oldFunction; else error.clear(); } editingFunction=false; return; }
+            if(k==sf::Keyboard::Key::Backspace && !input.empty()) { input.pop_back(); return; }
+            return;
+        }
+        if(localPlayer!=turn || shot.active || !matchStarted) return;
+        if(k==sf::Keyboard::Key::Up) power=std::min(5.f,power+0.1f);
+        if(k==sf::Keyboard::Key::Down) power=std::max(0.1f,power-0.1f);
+        if(k==sf::Keyboard::Key::Left) constant-=0.1f;
+        if(k==sf::Keyboard::Key::Right) constant+=0.1f;
+        if(k==sf::Keyboard::Key::F1) { function="sin(x)"; compileFunction(); }
+        if(k==sf::Keyboard::Key::F2) { function="0.25*x^2"; compileFunction(); }
+        if(k==sf::Keyboard::Key::F3) { function="2*sin(x)"; compileFunction(); }
+        if(k==sf::Keyboard::Key::F4) { function="x/2"; compileFunction(); }
+        if(k==sf::Keyboard::Key::Space) shoot();
+    }
+    void shoot() {
+        if(!compileFunction()) return;
+        shot.active=true; shot.t=0; shot.startX=players[turn].x; shot.startY=players[turn].y; shot.speed=power; shot.c=constant; shot.dir=(turn==0?1:-1); shot.expr=function;
+        if(net.host) broadcastShot(); else { sf::Packet p; p<<static_cast<std::int32_t>(Msg::Shoot)<<function<<power<<constant; net.send(p); }
+    }
+    void broadcastShot() {
+        sf::Packet p; p<<static_cast<std::int32_t>(Msg::Shoot)<<shot.expr<<shot.speed<<shot.c; net.send(p);
+    }
+    void network() {
+        if(net.host && !net.connected && screen==Screen::HostWait) {
+            if(net.acceptClient()) {
+                sf::Packet s; s<<static_cast<std::int32_t>(Msg::Settings)<<settings.scale<<settings.turnSeconds; net.send(s);
+                s.clear(); s<<static_cast<std::int32_t>(Msg::Start); net.send(s); startMatch();
+            }
+        }
+        if(!net.connected) return;
+        sf::Packet p;
+        while(net.receive(p)) {
+            std::int32_t type; if(!(p>>type)) continue;
+            if(type==static_cast<std::int32_t>(Msg::Settings)) { p>>settings.scale>>settings.turnSeconds; }
+            else if(type==static_cast<std::int32_t>(Msg::Start)) { localPlayer=1; startMatch(); }
+            else if(type==static_cast<std::int32_t>(Msg::Shoot)) {
+                std::string f; float pw,c; p>>f>>pw>>c;
+                if(net.host) { if(turn==1 && !shot.active) { function=f; power=pw; constant=c; compileFunction(); shot.active=true; shot.t=0; shot.startX=players[turn].x; shot.startY=players[turn].y; shot.speed=power; shot.c=constant; shot.dir=-1; shot.expr=function; broadcastState(); } }
+                else { function=f; power=pw; constant=c; compileFunction(); shot.active=true; shot.t=0; shot.startX=players[turn].x; shot.startY=players[turn].y; shot.speed=power; shot.c=constant; shot.dir=(turn==0?1:-1); shot.expr=function; }
+            } else if(type==static_cast<std::int32_t>(Msg::State)) receiveState(p);
+        }
+    }
+    void receiveState(sf::Packet& p) {
+        std::int32_t tr; p>>tr; turn=tr; p>>turnLeft; for(auto& pl:players) p>>pl.x>>pl.y>>pl.hp; std::int32_t active; p>>active; shot.active=active; if(shot.active) p>>shot.t>>shot.startX>>shot.startY>>shot.speed>>shot.c>>shot.dir>>shot.expr; std::int32_t win; p>>win; if(win>=0) { matchStarted=false; }
+    }
+    void broadcastState(int winner=-1) {
+        sf::Packet p; p<<static_cast<std::int32_t>(Msg::State)<<static_cast<std::int32_t>(turn)<<turnLeft; for(auto& pl:players) p<<pl.x<<pl.y<<pl.hp; p<<static_cast<std::int32_t>(shot.active); if(shot.active) p<<shot.t<<shot.startX<<shot.startY<<shot.speed<<shot.c<<shot.dir<<shot.expr; p<<static_cast<std::int32_t>(winner); net.send(p);
+    }
+    void endTurn() {
+        shot.active=false; turn=1-turn; turnLeft=settings.turnSeconds; compileFunction(); if(net.host) broadcastState();
+    }
+    void update(float dt) {
+        if(screen!=Screen::Game || !matchStarted) return;
+        if(net.host || !net.connected) {
+            turnLeft-=dt;
+            if(turnLeft<=0 && !shot.active) endTurn();
+            if(shot.active) updateShot(dt);
+            if(net.host) { syncTimer+=dt; if(syncTimer>0.05f) { syncTimer=0; broadcastState(); } }
+        } else {
+            // client displays authoritative state; no local simulation
+        }
+    }
+    void updateShot(float dt) {
+        shot.t+=dt;
+        float px=shot.startX + shot.dir*shot.t*shot.speed*260.f;
+        double gx=(px-shot.startX)/pixelsPerUnit(); double gy=compiled.eval(gx)+shot.c;
+        float py=shot.startY-static_cast<float>(gy*pixelsPerUnit());
+        // simple wind-like curvature, generated per match from settings.wind
+        py += settings.wind*shot.t*shot.t*15.f;
+        if(!std::isfinite(py) || px<-100 || px>cfg::W+100 || py<-200 || py>cfg::H+200) { endTurn(); return; }
+        int enemy=1-turn;
+        float d=std::hypot(px-players[enemy].x,py-players[enemy].y);
+        if(d<28.f) { players[enemy].hp=std::max(0,players[enemy].hp-25); shot.active=false; if(players[enemy].hp<=0) { matchStarted=false; if(net.host) broadcastState(turn); return; } endTurn(); return; }
+        float terrain=groundY(px); if(py>=terrain) { shot.active=false; endTurn(); }
+    }
+    void render() {
+        window.clear(sf::Color(15,18,25));
+        if(screen==Screen::Menu) drawMenu(); else if(screen==Screen::Settings) drawSettings(); else if(screen==Screen::Connect) drawConnect(); else if(screen==Screen::HostWait) drawWait(); else drawGame();
+        window.display();
+    }
+    void txt(const std::string& s,float x,float y,unsigned size=24) {
+        if(font.getInfo().family.empty()) return; sf::Text t(font,s,size); t.setPosition({x,y}); t.setFillColor(sf::Color::White); window.draw(t);
+    }
+    void drawMenu() {
+        txt("GRAPHWAR CLONE",430,100,42); txt("1  Host LAN game",450,250,28); txt("2  Join LAN game",450,300,28); txt("ESC  Exit",450,350,22); txt("C++20 / SFML 3.1",450,600,18);
+    }
+    void drawSettings() {
+        txt("MATCH SETTINGS",460,80,38); txt("Field scale: "+fmt(settings.scale)+"x    [LEFT/RIGHT]",300,220,28); txt("Turn time: "+fmt(settings.turnSeconds,0)+" sec    [UP/DOWN]",300,280,28); txt("ENTER  create LAN lobby",300,360,26); txt("ESC  back",300,410,22); if(!error.empty()) txt(error,300,500,20);
+    }
+    void drawConnect() { txt("JOIN LAN GAME",450,100,38); txt("Server IP:",350,230,26); txt(input,550,230,26); txt("ENTER  connect",350,300,24); txt("ESC  back",350,340,22); if(!error.empty()) txt(error,350,430,20); }
+    void drawWait() { txt("WAITING FOR SECOND PLAYER",360,180,36); txt("TCP port: 42069",480,250,24); txt("Scale: "+fmt(settings.scale)+"x",480,300,22); txt("Turn time: "+fmt(settings.turnSeconds,0)+" sec",480,335,22); txt("Tell the other player your LAN IPv4 address.",320,420,22); txt("ESC  cancel",480,500,20); }
+    void drawGame() {
+        drawGrid(); drawTerrain(); drawPlayers(); drawTrajectory();
+        txt("P"+std::to_string(turn+1)+" TURN   "+fmt(turnLeft,1)+"s",20,15,24); txt("f(x): "+function,20,50,20); txt("C: "+fmt(constant)+"   Power: "+fmt(power),20,78,20); txt("F1 sin(x)  F2 .25*x^2  F3 2*sin(x)  F4 x/2",20,110,18); txt("TAB: edit function   LEFT/RIGHT: C   UP/DOWN: power   SPACE: fire",20,136,18);
+        if(editingFunction) { txt("EDIT: "+input+"   ENTER: apply   BACKSPACE: delete",20,165,20); } txt("Scale "+fmt(settings.scale)+"x",1060,20,18);
+        for(int i=0;i<2;i++) txt("P"+std::to_string(i+1)+" HP "+std::to_string(players[i].hp), i?1080:40,670,20);
+        if(!matchStarted) txt(players[0].hp<=0?"PLAYER 2 WINS":"PLAYER 1 WINS",470,330,42);
+    }
+    static sf::Vertex makeVertex(sf::Vector2f position, sf::Color color) {
+        sf::Vertex v;
+        v.position = position;
+        v.color = color;
+        return v;
+    }
+
+    void drawGrid() {
+        sf::VertexArray lines(sf::PrimitiveType::Lines); for(int x=0;x<=static_cast<int>(cfg::W);x+=50){ lines.append(makeVertex(sf::Vector2f{static_cast<float>(x), 0.f}, sf::Color(32,36,47))); lines.append(makeVertex(sf::Vector2f{static_cast<float>(x), 620.f}, sf::Color(32,36,47))); } for(int y=0;y<=620;y+=50){lines.append(makeVertex(sf::Vector2f{0.f, static_cast<float>(y)}, sf::Color(32,36,47)));lines.append(makeVertex(sf::Vector2f{static_cast<float>(cfg::W), static_cast<float>(y)}, sf::Color(32,36,47)));} window.draw(lines);
+    }
+    void drawTerrain() {
+        sf::VertexArray poly(sf::PrimitiveType::TriangleStrip); for(int x=0;x<=static_cast<int>(cfg::W);x+=4){ float y=groundY(static_cast<float>(x)); poly.append(makeVertex(sf::Vector2f{static_cast<float>(x), y}, sf::Color(65,72,52))); poly.append(makeVertex(sf::Vector2f{static_cast<float>(x), 620.f}, sf::Color(40,44,35))); } window.draw(poly);
+    }
+    void drawPlayers() { for(int i=0;i<2;i++){ sf::CircleShape c(22); c.setOrigin({22,22}); c.setPosition({players[i].x,players[i].y}); c.setFillColor(i==0?sf::Color(80,160,255):sf::Color(255,90,90)); window.draw(c); sf::RectangleShape bg({70,7}); bg.setPosition({players[i].x-35,players[i].y-40}); bg.setFillColor(sf::Color(45,45,45)); window.draw(bg); sf::RectangleShape hp({70*players[i].hp/100.f,7}); hp.setPosition({players[i].x-35,players[i].y-40}); hp.setFillColor(i==0?sf::Color(80,160,255):sf::Color(255,90,90)); window.draw(hp); } }
+    void drawTrajectory() {
+        if(shot.active) {
+            std::vector<sf::Vertex> pts; for(int i=0;i<180;i++){float tt=shot.t+i*0.03f;float px=shot.startX+shot.dir*tt*shot.speed*260.f;double gx=(px-shot.startX)/pixelsPerUnit();double gy=compiled.eval(gx)+shot.c;float py=shot.startY-static_cast<float>(gy*pixelsPerUnit())+settings.wind*tt*tt*15.f;if(std::isfinite(py)&&px>=0&&px<=cfg::W&&py>=0&&py<=620)pts.emplace_back(makeVertex(sf::Vector2f{px, py}, sf::Color(230,230,230)));} if(pts.size()>1) window.draw(pts.data(),pts.size(),sf::PrimitiveType::LineStrip); sf::CircleShape b(7);b.setOrigin({7,7});float px=shot.startX+shot.dir*shot.t*shot.speed*260.f;double gx=(px-shot.startX)/pixelsPerUnit();double gy=compiled.eval(gx)+shot.c;float py=shot.startY-static_cast<float>(gy*pixelsPerUnit())+settings.wind*shot.t*shot.t*15.f;b.setPosition({px,py});b.setFillColor(sf::Color::White);window.draw(b);
+        } else if(localPlayer==turn) {
+            std::vector<sf::Vertex> pts; for(int i=0;i<180;i++){float px=players[turn].x+(turn? -1.f:1.f)*i*4.f; double gx=(px-players[turn].x)/pixelsPerUnit();double gy=compiled.eval(gx)+constant;float py=players[turn].y-static_cast<float>(gy*pixelsPerUnit());if(std::isfinite(py)&&px>=0&&px<=cfg::W&&py>=0&&py<=620)pts.emplace_back(makeVertex(sf::Vector2f{px, py}, sf::Color(120,180,255)));} if(pts.size()>1)window.draw(pts.data(),pts.size(),sf::PrimitiveType::LineStrip);
+        }
+    }
+};
+
+int main(){ GameApp app; app.run(); }

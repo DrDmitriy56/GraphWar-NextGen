@@ -1,0 +1,491 @@
+#include <SFML/Graphics.hpp>
+#include <SFML/Network.hpp>
+#include <SFML/Window.hpp>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <memory>
+#include <iostream>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include "Expression.hpp"
+
+namespace cfg { constexpr unsigned W=1280, H=720; constexpr unsigned short PORT=42069; constexpr float PI=3.14159265358979323846f; }
+
+enum class Screen { Menu, Settings, HostWait, Connect, Game };
+enum class Msg : std::int32_t { Hello=1, Settings=2, Start=3, Shoot=4, State=5, Ping=6, Disconnect=7 };
+
+struct Settings {
+    float scale=1.0f;
+    float turnSeconds=60.0f;
+    float wind=0.0f;
+    int fieldWidth=2400;
+    int fieldHeight=1200;
+    bool prediction=true;
+};
+struct Player { float x=0, y=0; int hp=100; };
+struct Shot { bool active=false; float t=0, startX=0, startY=0, speed=1.0f, c=0; int dir=1; std::string expr; };
+
+static std::string fmt(float v, int p=2) { std::ostringstream s; s<<std::fixed<<std::setprecision(p)<<v; return s.str(); }
+
+class Net {
+public:
+    bool host=false, connected=false;
+    sf::TcpListener listener;
+    sf::TcpSocket socket;
+
+    bool startHost() {
+        if (listener.listen(cfg::PORT) != sf::Socket::Status::Done) return false;
+        listener.setBlocking(false); host=true; return true;
+    }
+    bool acceptClient() {
+        if (connected) return true;
+        auto c=std::make_unique<sf::TcpSocket>();
+        if (listener.accept(*c)==sf::Socket::Status::Done) {
+            socket=std::move(*c); socket.setBlocking(false); connected=true; listener.close(); return true;
+        }
+        return false;
+    }
+    bool connectTo(const std::string& ip) {
+        auto a=sf::IpAddress::fromString(ip); if(!a) return false;
+        if(socket.connect(*a,cfg::PORT,sf::seconds(3))!=sf::Socket::Status::Done) return false;
+        socket.setBlocking(false); connected=true; host=false; return true;
+    }
+    void send(sf::Packet& p) { if(connected) { (void)socket.send(p); } }
+    bool receive(sf::Packet& p) { if(!connected) return false; return socket.receive(p)==sf::Socket::Status::Done; }
+    void close() { socket.disconnect(); listener.close(); connected=false; }
+};
+
+class GameApp {
+    sf::RenderWindow window{sf::VideoMode({cfg::W,cfg::H}),"GraphWar Clone"};
+    sf::Font font;
+    Screen screen=Screen::Menu;
+    Settings settings;
+    Net net;
+    Player players[2];
+    Shot shot;
+    int localPlayer=0, turn=0;
+    float turnLeft=60;
+    float power=1.4f, constant=0.0f;
+    std::string function="sin(x)";
+    std::string input;
+    std::string error;
+    std::mt19937 rng{std::random_device{}()};
+    sf::Clock clock;
+    float syncTimer=0;
+    Expression compiled;
+    bool matchStarted=false;
+    bool editingFunction=false;
+    int selectedSetting=0;
+    sf::View worldView;
+    std::vector<float> terrain;
+    bool fullscreen=false;
+
+public:
+    GameApp() {
+        window.setFramerateLimit(120);
+        (void)font.openFromFile("assets/arial.ttf");
+        window.setKeyRepeatEnabled(true);
+        resetPlayers();
+        rebuildTerrain();
+        updateWorldView();
+    }
+    void run() {
+        while(window.isOpen()) {
+            float dt=clock.restart().asSeconds();
+            events();
+            network();
+            update(std::min(dt,0.05f));
+            render();
+        }
+    }
+private:
+    void resetPlayers() {
+        rebuildTerrain();
+        std::uniform_int_distribution<int> dist(100, std::max(101, settings.fieldWidth-100));
+        int x0=dist(rng), x1=dist(rng);
+        for(int tries=0; tries<100 && std::abs(x1-x0)<settings.fieldWidth/3; ++tries) x1=dist(rng);
+        // Additional large obstacles specifically between the players.
+        int lo=std::min(x0,x1), hi=std::max(x0,x1);
+        std::uniform_int_distribution<int> midCount(3,6);
+        for(int n=0;n<midCount(rng);++n) {
+            int cx=std::uniform_int_distribution<int>(lo+80, std::max(lo+81,hi-80))(rng);
+            int radius=std::uniform_int_distribution<int>(45,110)(rng);
+            float h=std::uniform_real_distribution<float>(settings.fieldHeight*0.10f,settings.fieldHeight*0.24f)(rng);
+            for(int x=std::max(lo,cx-radius);x<std::min(hi,cx+radius);++x) {
+                float q=1.f-std::abs(x-cx)/static_cast<float>(radius);
+                terrain[x]=std::max(terrain[x]-h*q, settings.fieldHeight*0.30f);
+            }
+        }
+
+        players[0]={static_cast<float>(x0), terrainY(x0)-24.f,100};
+        players[1]={static_cast<float>(x1), terrainY(x1)-24.f,100};
+        turn=0; turnLeft=settings.turnSeconds; shot={};
+    }
+    void startMatch() {
+        resetPlayers();
+        matchStarted=true; screen=Screen::Game; turnLeft=settings.turnSeconds;
+        if(!compileFunction()) { function="sin(x)"; compileFunction(); }
+    }
+    float terrainY(int x) const {
+        if(terrain.empty()) return settings.fieldHeight*0.72f;
+        x=std::clamp(x,0,static_cast<int>(terrain.size())-1);
+        return terrain[x];
+    }
+
+    void rebuildTerrain() {
+        terrain.resize(std::max(200, settings.fieldWidth));
+        std::uniform_real_distribution<float> phase(0.f,6.28f);
+        std::uniform_real_distribution<float> amp(0.6f,1.4f);
+        float p1=phase(rng), p2=phase(rng), p3=phase(rng);
+        float a1=amp(rng), a2=amp(rng), a3=amp(rng);
+        const float base=settings.fieldHeight*0.68f;
+        for(int x=0;x<settings.fieldWidth;x++) {
+            float y=base
+                + settings.fieldHeight*0.075f*a1*std::sin(x*0.0042f+p1)
+                + settings.fieldHeight*0.045f*a2*std::sin(x*0.011f+p2)
+                + settings.fieldHeight*0.025f*a3*std::sin(x*0.023f+p3);
+            terrain[x]=std::clamp(y, settings.fieldHeight*0.48f, settings.fieldHeight*0.84f);
+        }
+        // Несколько искусственных холмов/препятствий между случайными позициями.
+        std::uniform_int_distribution<int> countDist(5,9);
+        std::uniform_int_distribution<int> xDist(settings.fieldWidth/5, settings.fieldWidth*4/5);
+        std::uniform_real_distribution<float> hDist(settings.fieldHeight*0.08f, settings.fieldHeight*0.20f);
+        for(int n=0;n<countDist(rng);++n) {
+            int cx=xDist(rng), radius=std::uniform_int_distribution<int>(40,100)(rng);
+            float h=hDist(rng);
+            for(int x=std::max(0,cx-radius);x<std::min(settings.fieldWidth,cx+radius);++x) {
+                float q=1.f-std::abs(x-cx)/static_cast<float>(radius);
+                terrain[x]=std::max(terrain[x]-h*q, settings.fieldHeight*0.35f);
+            }
+        }
+    }
+
+    float groundY(float x) const {
+        return terrainY(static_cast<int>(std::round(x)));
+    }
+
+    void destroyTerrain(float cx, float cy, float radius) {
+        if(terrain.empty()) return;
+        int left=std::max(0, static_cast<int>(cx-radius));
+        int right=std::min(settings.fieldWidth-1, static_cast<int>(cx+radius));
+        for(int x=left;x<=right;++x) {
+            float dx=x-cx;
+            if(std::abs(dx)>=radius) continue;
+            float depth=std::sqrt(radius*radius-dx*dx);
+            float bottom=cy+depth;
+            if(terrain[x]<bottom) {
+                terrain[x]=std::min(bottom, static_cast<float>(settings.fieldHeight-25));
+            }
+        }
+    }
+
+    float pixelsPerUnit() const { return 85.f*settings.scale; }
+    float worldX(float px, float originX) const { return (px-originX)/pixelsPerUnit(); }
+    float graphY(float px, float originX) const {
+        double x=worldX(px,originX), y=compiled.eval(x)+constant;
+        if(!std::isfinite(y) || std::abs(y)>1000) return NAN;
+        return players[turn].y-static_cast<float>(y*pixelsPerUnit());
+    }
+
+    void updateWorldView() {
+        float ww=static_cast<float>(window.getSize().x);
+        float wh=static_cast<float>(window.getSize().y);
+        float fw=static_cast<float>(settings.fieldWidth);
+        float fh=static_cast<float>(settings.fieldHeight);
+        float scale=std::min(ww/fw,wh/fh);
+        float vw=(fw*scale)/ww;
+        float vh=(fh*scale)/wh;
+        worldView.setCenter({fw/2.f,fh/2.f});
+        worldView.setSize({fw,fh});
+        worldView.setViewport(sf::FloatRect({(1.f-vw)/2.f,(1.f-vh)/2.f},{vw,vh}));
+    }
+
+    void toggleFullscreen() {
+        fullscreen=!fullscreen;
+        if(fullscreen) {
+            window.create(sf::VideoMode::getDesktopMode(),"GraphWar Clone",sf::State::Fullscreen);
+        } else {
+            window.create(sf::VideoMode({cfg::W,cfg::H}),"GraphWar Clone",sf::Style::Default);
+        }
+        window.setFramerateLimit(120);
+        updateWorldView();
+    }
+
+    bool compileFunction() {
+        std::string e; if(!compiled.parse(function,e)) { error=e; return false; } error.clear(); return true;
+    }
+    void events() {
+        while(auto ev=window.pollEvent()) {
+            if(ev->is<sf::Event::Closed>()) window.close();
+            if(ev->is<sf::Event::Resized>()) updateWorldView();
+            if(auto* k=ev->getIf<sf::Event::KeyPressed>()) key(k->code);
+            if(auto* t=ev->getIf<sf::Event::TextEntered>()) text(t->unicode);
+        }
+    }
+    void text(char32_t u) {
+        if(screen==Screen::Settings || screen==Screen::Connect || (screen==Screen::Game && editingFunction)) {
+            if(u>=32 && u<127 && input.size()<80) input.push_back(static_cast<char>(u));
+        }
+    }
+    void key(sf::Keyboard::Key k) {
+        if(k==sf::Keyboard::Key::F11) { toggleFullscreen(); return; }
+        if(k==sf::Keyboard::Key::Escape && screen!=Screen::Menu) { net.close(); screen=Screen::Menu; editingFunction=false; return; }
+        if(screen==Screen::Menu) {
+            if(k==sf::Keyboard::Key::Num1) { net.close(); net.host=true; screen=Screen::Settings; }
+            else if(k==sf::Keyboard::Key::Num2) { input="127.0.0.1"; screen=Screen::Connect; }
+        } else if(screen==Screen::Settings) settingsKey(k);
+        else if(screen==Screen::Connect) {
+            if(k==sf::Keyboard::Key::Enter) { if(net.connectTo(input)) { localPlayer=1; screen=Screen::HostWait; } else error="Connection failed"; }
+            else if(k==sf::Keyboard::Key::Backspace && !input.empty()) input.pop_back();
+        } else if(screen==Screen::Game) gameKey(k);
+    }
+    void settingsKey(sf::Keyboard::Key k) {
+        if(k==sf::Keyboard::Key::Tab) { selectedSetting=(selectedSetting+1)%5; return; }
+        if(k==sf::Keyboard::Key::Left || k==sf::Keyboard::Key::Right) {
+            int d=(k==sf::Keyboard::Key::Right)?1:-1;
+            if(selectedSetting==0) settings.fieldWidth=std::clamp(settings.fieldWidth+d*100,800,8000);
+            if(selectedSetting==1) settings.fieldHeight=std::clamp(settings.fieldHeight+d*100,600,4000);
+            if(selectedSetting==2) settings.scale=std::clamp(settings.scale+d*0.25f,0.5f,3.0f);
+            if(selectedSetting==3) settings.turnSeconds=std::clamp(settings.turnSeconds+d*5.f,5.f,300.f);
+            if(selectedSetting==4) settings.prediction=!settings.prediction;
+        }
+        if(k==sf::Keyboard::Key::Enter) {
+            if(net.host) { if(net.startHost()) screen=Screen::HostWait; else error="Port 42069 is unavailable"; }
+        }
+    }
+
+    void gameKey(sf::Keyboard::Key k) {
+        if(k==sf::Keyboard::Key::Tab && !shot.active && matchStarted && localPlayer==turn) { editingFunction=!editingFunction; if(editingFunction) input=function; return; }
+        if(editingFunction) {
+            if(k==sf::Keyboard::Key::Enter) { if(!input.empty()) { std::string oldFunction=function; function=input; if(!compileFunction()) function=oldFunction; else error.clear(); } editingFunction=false; return; }
+            if(k==sf::Keyboard::Key::Backspace && !input.empty()) { input.pop_back(); return; }
+            return;
+        }
+        if(localPlayer!=turn || shot.active || !matchStarted) return;
+        if(k==sf::Keyboard::Key::Up) power=std::min(5.f,power+0.1f);
+        if(k==sf::Keyboard::Key::Down) power=std::max(0.1f,power-0.1f);
+        if(k==sf::Keyboard::Key::Left) constant-=0.1f;
+        if(k==sf::Keyboard::Key::Right) constant+=0.1f;
+        if(k==sf::Keyboard::Key::F1) { function="sin(x)"; compileFunction(); }
+        if(k==sf::Keyboard::Key::F2) { function="0.25*x^2"; compileFunction(); }
+        if(k==sf::Keyboard::Key::F3) { function="2*sin(x)"; compileFunction(); }
+        if(k==sf::Keyboard::Key::F4) { function="x/2"; compileFunction(); }
+        if(k==sf::Keyboard::Key::Space) shoot();
+    }
+    void shoot() {
+        if(!compileFunction()) return;
+        shot.active=true; shot.t=0; shot.startX=players[turn].x; shot.startY=players[turn].y; shot.speed=power; shot.c=constant; shot.dir=(turn==0?1:-1); shot.expr=function;
+        if(net.host) broadcastShot(); else { sf::Packet p; p<<static_cast<std::int32_t>(Msg::Shoot)<<function<<power<<constant; net.send(p); }
+    }
+    void broadcastShot() {
+        sf::Packet p; p<<static_cast<std::int32_t>(Msg::Shoot)<<shot.expr<<shot.speed<<shot.c; net.send(p);
+    }
+    void network() {
+        if(net.host && !net.connected && screen==Screen::HostWait) {
+            if(net.acceptClient()) {
+                sf::Packet s; s<<static_cast<std::int32_t>(Msg::Settings)<<settings.scale<<settings.turnSeconds<<settings.fieldWidth<<settings.fieldHeight<<static_cast<std::int32_t>(settings.prediction); net.send(s);
+                s.clear(); s<<static_cast<std::int32_t>(Msg::Start); net.send(s); startMatch(); broadcastState();
+            }
+        }
+        if(!net.connected) return;
+        sf::Packet p;
+        while(net.receive(p)) {
+            std::int32_t type; if(!(p>>type)) continue;
+            if(type==static_cast<std::int32_t>(Msg::Settings)) { p>>settings.scale>>settings.turnSeconds>>settings.fieldWidth>>settings.fieldHeight; std::int32_t pred=1; p>>pred; settings.prediction=(pred!=0); rebuildTerrain(); updateWorldView(); }
+            else if(type==static_cast<std::int32_t>(Msg::Start)) { localPlayer=1; startMatch(); }
+            else if(type==static_cast<std::int32_t>(Msg::Shoot)) {
+                std::string f; float pw,c; p>>f>>pw>>c;
+                if(net.host) { if(turn==1 && !shot.active) { function=f; power=pw; constant=c; compileFunction(); shot.active=true; shot.t=0; shot.startX=players[turn].x; shot.startY=players[turn].y; shot.speed=power; shot.c=constant; shot.dir=-1; shot.expr=function; broadcastState(); } }
+                else { function=f; power=pw; constant=c; compileFunction(); shot.active=true; shot.t=0; shot.startX=players[turn].x; shot.startY=players[turn].y; shot.speed=power; shot.c=constant; shot.dir=(turn==0?1:-1); shot.expr=function; }
+            } else if(type==static_cast<std::int32_t>(Msg::State)) receiveState(p);
+        }
+    }
+    void receiveState(sf::Packet& p) {
+        std::int32_t tr; p>>tr; turn=tr; p>>turnLeft;
+        for(auto& pl:players) p>>pl.x>>pl.y>>pl.hp;
+        std::int32_t active; p>>active; shot.active=active;
+        if(shot.active) p>>shot.t>>shot.startX>>shot.startY>>shot.speed>>shot.c>>shot.dir>>shot.expr;
+        std::int32_t terrainCount=0; p>>terrainCount;
+        if(terrainCount>0 && terrainCount<=10000) {
+            terrain.resize(terrainCount);
+            for(auto& v:terrain) { std::int16_t q=0; p>>q; v=static_cast<float>(q); }
+        }
+        std::int32_t win; p>>win; if(win>=0) { matchStarted=false; }
+    }
+    void broadcastState(int winner=-1) {
+        sf::Packet p;
+        p<<static_cast<std::int32_t>(Msg::State)<<static_cast<std::int32_t>(turn)<<turnLeft;
+        for(auto& pl:players) p<<pl.x<<pl.y<<pl.hp;
+        p<<static_cast<std::int32_t>(shot.active);
+        if(shot.active) p<<shot.t<<shot.startX<<shot.startY<<shot.speed<<shot.c<<shot.dir<<shot.expr;
+        p<<static_cast<std::int32_t>(terrain.size());
+        for(float v:terrain) {
+            auto q=static_cast<std::int16_t>(std::clamp(v,0.f,32767.f));
+            p<<q;
+        }
+        p<<static_cast<std::int32_t>(winner);
+        net.send(p);
+    }
+    void endTurn() {
+        shot.active=false; turn=1-turn; turnLeft=settings.turnSeconds; compileFunction(); if(net.host) broadcastState();
+    }
+    void update(float dt) {
+        if(screen!=Screen::Game || !matchStarted) return;
+        if(net.host || !net.connected) {
+            turnLeft-=dt;
+            if(turnLeft<=0 && !shot.active) endTurn();
+            if(shot.active) updateShot(dt);
+            if(net.host) { syncTimer+=dt; if(syncTimer>0.05f) { syncTimer=0; broadcastState(); } }
+        } else {
+            // client displays authoritative state; no local simulation
+        }
+    }
+    void updateShot(float dt) {
+        shot.t+=dt;
+        float px=shot.startX + shot.dir*shot.t*shot.speed*260.f;
+        double gx=(px-shot.startX)/pixelsPerUnit(); double gy=compiled.eval(gx)+shot.c;
+        float py=shot.startY-static_cast<float>(gy*pixelsPerUnit());
+        // simple wind-like curvature, generated per match from settings.wind
+        py += settings.wind*shot.t*shot.t*15.f;
+        if(!std::isfinite(py) || px<-100 || px>cfg::W+100 || py<-200 || py>cfg::H+200) { endTurn(); return; }
+        int enemy=1-turn;
+        float d=std::hypot(px-players[enemy].x,py-players[enemy].y);
+        if(d<28.f) {
+            players[enemy].hp=std::max(0,players[enemy].hp-25);
+            destroyTerrain(px,py,70.f);
+            players[enemy].y=groundY(players[enemy].x)-24.f;
+            shot.active=false;
+            if(players[enemy].hp<=0) { matchStarted=false; if(net.host) broadcastState(turn); return; }
+            endTurn();
+            return;
+        }
+        float terrain=groundY(px);
+        if(py>=terrain) {
+            destroyTerrain(px,py,55.f);
+            players[0].y=groundY(players[0].x)-24.f;
+            players[1].y=groundY(players[1].x)-24.f;
+            shot.active=false;
+            endTurn();
+        }
+    }
+    void render() {
+        window.clear(sf::Color(15,18,25));
+        if(screen==Screen::Game) {
+            window.setView(worldView);
+            drawGrid(); drawTerrain(); drawPlayers(); drawTrajectory();
+            window.setView(window.getDefaultView());
+            drawGameUI();
+        } else {
+            window.setView(window.getDefaultView());
+            if(screen==Screen::Menu) drawMenu();
+            else if(screen==Screen::Settings) drawSettings();
+            else if(screen==Screen::Connect) drawConnect();
+            else if(screen==Screen::HostWait) drawWait();
+        }
+        window.display();
+    }
+    void txt(const std::string& s,float x,float y,unsigned size=24) {
+        if(font.getInfo().family.empty()) return; sf::Text t(font,s,size); t.setPosition({x,y}); t.setFillColor(sf::Color::White); window.draw(t);
+    }
+    void drawMenu() {
+        txt("GRAPHWAR CLONE",430,100,42); txt("1  Host LAN game",450,250,28); txt("2  Join LAN game",450,300,28); txt("ESC  Exit",450,350,22); txt("C++20 / SFML 3.1",450,600,18);
+    }
+    void drawSettings() {
+        txt("MATCH SETTINGS",460,70,38);
+        txt(std::string(selectedSetting==0?"> ":"  ")+"Field width: "+std::to_string(settings.fieldWidth),300,170,26);
+        txt(std::string(selectedSetting==1?"> ":"  ")+"Field height: "+std::to_string(settings.fieldHeight),300,215,26);
+        txt(std::string(selectedSetting==2?"> ":"  ")+"Graph scale: "+fmt(settings.scale)+"x",300,260,26);
+        txt(std::string(selectedSetting==3?"> ":"  ")+"Turn time: "+fmt(settings.turnSeconds,0)+" sec",300,305,26);
+        txt(std::string(selectedSetting==4?"> ":"  ")+"Trajectory prediction: "+std::string(settings.prediction?"ON":"OFF"),300,350,26);
+        txt("TAB select setting   LEFT/RIGHT change",300,420,20);
+        txt("ENTER create LAN lobby",300,455,24);
+        txt("F11 fullscreen   ESC back",300,495,20);
+        if(!error.empty()) txt(error,300,550,20);
+    }
+    void drawConnect() { txt("JOIN LAN GAME",450,100,38); txt("Server IP:",350,230,26); txt(input,550,230,26); txt("ENTER  connect",350,300,24); txt("ESC  back",350,340,22); if(!error.empty()) txt(error,350,430,20); }
+    void drawWait() { txt("WAITING FOR SECOND PLAYER",360,150,36); txt("TCP port: 42069",480,220,24); txt("Field: "+std::to_string(settings.fieldWidth)+" x "+std::to_string(settings.fieldHeight),480,265,22); txt("Scale: "+fmt(settings.scale)+"x",480,300,22); txt("Turn time: "+fmt(settings.turnSeconds,0)+" sec",480,335,22); txt("Prediction: "+std::string(settings.prediction?"ON":"OFF"),480,370,22); txt("Tell the other player your LAN IPv4 address.",320,430,22); txt("ESC  cancel",480,500,20); }
+    void drawGameUI() {
+        txt("P"+std::to_string(turn+1)+" TURN   "+fmt(turnLeft,1)+"s",20,15,24);
+        txt("f(x): "+function,20,50,20);
+        txt("C: "+fmt(constant)+"   Power: "+fmt(power),20,78,20);
+        txt("TAB edit   LEFT/RIGHT C   UP/DOWN power   SPACE fire   F11 fullscreen",20,108,17);
+        txt(std::string("Prediction: ")+(settings.prediction?"ON":"OFF")+"   Field: "+std::to_string(settings.fieldWidth)+" x "+std::to_string(settings.fieldHeight),20,132,17);
+        if(editingFunction) txt("EDIT: "+input+"   ENTER apply   BACKSPACE delete",20,158,20);
+        for(int i=0;i<2;i++) txt("P"+std::to_string(i+1)+" HP "+std::to_string(players[i].hp), i?window.getSize().x-170:40,window.getSize().y-35,20);
+        if(!matchStarted) txt(players[0].hp<=0?"PLAYER 2 WINS":"PLAYER 1 WINS",window.getSize().x/2.f-150,window.getSize().y/2.f,42);
+    }
+    static sf::Vertex makeVertex(sf::Vector2f position, sf::Color color) {
+        sf::Vertex v;
+        v.position = position;
+        v.color = color;
+        return v;
+    }
+
+    void drawGrid() {
+        sf::VertexArray lines(sf::PrimitiveType::Lines);
+        int step=100;
+        for(int x=0;x<=settings.fieldWidth;x+=step) {
+            lines.append(makeVertex({static_cast<float>(x),0.f},sf::Color(32,36,47)));
+            lines.append(makeVertex({static_cast<float>(x),static_cast<float>(settings.fieldHeight)},sf::Color(32,36,47)));
+        }
+        for(int y=0;y<=settings.fieldHeight;y+=step) {
+            lines.append(makeVertex({0.f,static_cast<float>(y)},sf::Color(32,36,47)));
+            lines.append(makeVertex({static_cast<float>(settings.fieldWidth),static_cast<float>(y)},sf::Color(32,36,47)));
+        }
+        window.draw(lines);
+    }
+
+    void drawTerrain() {
+        sf::VertexArray poly(sf::PrimitiveType::TriangleStrip);
+        for(int x=0;x<settings.fieldWidth;x+=3) {
+            float y=terrainY(x);
+            poly.append(makeVertex({static_cast<float>(x),y},sf::Color(65,72,52)));
+            poly.append(makeVertex({static_cast<float>(x),static_cast<float>(settings.fieldHeight)},sf::Color(40,44,35)));
+        }
+        window.draw(poly);
+    }
+
+    void drawPlayers() { for(int i=0;i<2;i++){ sf::CircleShape c(22); c.setOrigin({22,22}); c.setPosition({players[i].x,players[i].y}); c.setFillColor(i==0?sf::Color(80,160,255):sf::Color(255,90,90)); window.draw(c); sf::RectangleShape bg({70,7}); bg.setPosition({players[i].x-35,players[i].y-40}); bg.setFillColor(sf::Color(45,45,45)); window.draw(bg); sf::RectangleShape hp({70*players[i].hp/100.f,7}); hp.setPosition({players[i].x-35,players[i].y-40}); hp.setFillColor(i==0?sf::Color(80,160,255):sf::Color(255,90,90)); window.draw(hp); } }
+    void drawTrajectory() {
+        if(shot.active) {
+            std::vector<sf::Vertex> pts;
+            for(int i=0;i<70;i++) {
+                float tt=shot.t+i*0.035f;
+                float px=shot.startX+shot.dir*tt*shot.speed*260.f;
+                double gx=(px-shot.startX)/pixelsPerUnit();
+                double gy=compiled.eval(gx)+shot.c;
+                float py=shot.startY-static_cast<float>(gy*pixelsPerUnit())+settings.wind*tt*tt*15.f;
+                if(std::isfinite(py)&&px>=0&&px<=settings.fieldWidth&&py>=0&&py<=settings.fieldHeight)
+                    pts.emplace_back(makeVertex({px,py},sf::Color(230,230,230)));
+            }
+            if(pts.size()>1) window.draw(pts.data(),pts.size(),sf::PrimitiveType::LineStrip);
+            float px=shot.startX+shot.dir*shot.t*shot.speed*260.f;
+            double gx=(px-shot.startX)/pixelsPerUnit();
+            double gy=compiled.eval(gx)+shot.c;
+            float py=shot.startY-static_cast<float>(gy*pixelsPerUnit())+settings.wind*shot.t*shot.t*15.f;
+            sf::CircleShape b(7); b.setOrigin({7,7}); b.setPosition({px,py}); b.setFillColor(sf::Color::White); window.draw(b);
+        } else if(settings.prediction && localPlayer==turn) {
+            std::vector<sf::Vertex> pts;
+            for(int i=0;i<55;i++) {
+                float px=players[turn].x+(turn?-1.f:1.f)*i*4.f;
+                double gx=(px-players[turn].x)/pixelsPerUnit();
+                double gy=compiled.eval(gx)+constant;
+                float py=players[turn].y-static_cast<float>(gy*pixelsPerUnit());
+                if(std::isfinite(py)&&px>=0&&px<=settings.fieldWidth&&py>=0&&py<=settings.fieldHeight)
+                    pts.emplace_back(makeVertex({px,py},sf::Color(120,180,255)));
+            }
+            if(pts.size()>1) window.draw(pts.data(),pts.size(),sf::PrimitiveType::LineStrip);
+        }
+    }
+
+};
+
+int main(){ GameApp app; app.run(); }
